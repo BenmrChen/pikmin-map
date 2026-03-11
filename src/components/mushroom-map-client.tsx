@@ -1,7 +1,7 @@
 "use client";
 
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import maplibregl, { type Map } from "maplibre-gl";
+import maplibregl, { type GeoJSONSource, type Map } from "maplibre-gl";
 import type { StyleSpecification } from "maplibre-gl";
 
 import {
@@ -24,6 +24,7 @@ import type {
 import {
   buildCurrentLocationRecenterPlan,
   buildMushroomMarkerShortLabelMap,
+  reconcileDisplayMushrooms,
   CURRENT_LOCATION_ZOOM,
   getCurrentLocationActionLabel,
   getCurrentLocationStatusMessage,
@@ -55,6 +56,9 @@ const NEARBY_RADIUS_METERS = 1200;
 const DEFAULT_MAP_CENTER: [number, number] = [121.53431, 25.03291];
 const DEFAULT_MAP_ZOOM = 12.4;
 const COMPACT_CANDIDATE_MARKER_THRESHOLD = 80;
+const MUSHROOM_SOURCE_ID = "mushrooms";
+const MUSHROOM_CIRCLE_LAYER_ID = "mushroom-circles";
+const MUSHROOM_LABEL_LAYER_ID = "mushroom-labels";
 
 const MAP_STYLE: StyleSpecification = {
   version: 8,
@@ -140,15 +144,40 @@ function toViewport(bounds: maplibregl.LngLatBounds): MapViewport {
   };
 }
 
+function buildMushroomFeatureCollection(mushrooms: VisibleMushroom[]): GeoJSON.FeatureCollection<GeoJSON.Point> {
+  return {
+    type: "FeatureCollection",
+    features: mushrooms.map((mushroom) => ({
+      type: "Feature",
+      id: mushroom.id,
+      geometry: {
+        type: "Point",
+        coordinates: [mushroom.longitude, mushroom.latitude],
+      },
+      properties: {
+        id: mushroom.id,
+        title: mushroom.title ?? mushroom.externalKey,
+        layer: getLocationSourceLayer(mushroom),
+        status: mushroom.derivedState?.currentStatus ?? "UNKNOWN",
+        shortLabel: markerShortLabelFallback(mushroom),
+      },
+    })),
+  };
+}
+
+function markerShortLabelFallback(mushroom: MushroomLocationRecord): string {
+  return getMushroomMarkerShortLabel(mushroom);
+}
+
 export function MushroomMapClient() {
   const mapRef = useRef<Map | null>(null);
   const mapContainerRef = useRef<HTMLDivElement | null>(null);
-  const markersRef = useRef<maplibregl.Marker[]>([]);
   const currentLocationMarkerRef = useRef<maplibregl.Marker | null>(null);
   const currentLocationRef = useRef<CurrentLocationState>({
     status: "idle",
   });
   const refreshMushroomsRef = useRef<() => void>(() => {});
+  const visibleMushroomsRef = useRef<VisibleMushroom[]>([]);
   const lastLocationRefreshKeyRef = useRef<string | null>(null);
   const [mushrooms, setMushrooms] = useState<MushroomLocationRecord[]>([]);
   const [selectedId, setSelectedId] = useState<string | null>(null);
@@ -216,7 +245,7 @@ export function MushroomMapClient() {
 
   const layerCounts = useMemo(
     () =>
-      sortedMushrooms.reduce<LayerVisibilityState>(
+      sortedMushrooms.reduce<Record<MushroomLocationSourceLayer, number>>(
         (counts, mushroom) => {
           counts[getLocationSourceLayer(mushroom)] += 1;
           return counts;
@@ -266,33 +295,6 @@ export function MushroomMapClient() {
     [visibleMushrooms],
   );
 
-  const createMushroomMarkerElement = useCallback((mushroom: MushroomLocationRecord) => {
-    const element = document.createElement("button");
-    const tone = getMushroomMarkerTone(mushroom.derivedState?.currentStatus);
-    const layer = getLocationSourceLayer(mushroom);
-    const isCompactCandidate = layer === "candidate" && useCompactCandidateMarkers;
-
-    element.type = "button";
-    element.className = `mushroom-map-marker mushroom-map-marker--${tone} mushroom-map-marker--layer-${layer}${isCompactCandidate ? " mushroom-map-marker--compact" : ""}`;
-    element.setAttribute("aria-label", getMushroomMarkerLabel(mushroom));
-    element.title = mushroom.title ?? mushroom.externalKey;
-
-    const cap = document.createElement("span");
-    cap.className = "mushroom-map-marker__cap";
-    const shortLabel = document.createElement("span");
-    shortLabel.className = "mushroom-map-marker__short-label";
-    shortLabel.textContent =
-      markerShortLabelMap[mushroom.id] ?? getMushroomMarkerShortLabel(mushroom);
-    const connector = document.createElement("span");
-    connector.className = "mushroom-map-marker__connector";
-    const dot = document.createElement("span");
-    dot.className = "mushroom-map-marker__dot";
-
-    cap.append(shortLabel);
-    element.append(cap, connector, dot);
-    return element;
-  }, [markerShortLabelMap, useCompactCandidateMarkers]);
-
   const createCurrentLocationElement = useCallback(() => {
     const element = document.createElement("div");
     element.className = "current-location-marker";
@@ -335,36 +337,6 @@ export function MushroomMapClient() {
     }));
   }, [currentLatitude, currentLongitude]);
 
-  const syncMarkers = useCallback((nextMushrooms: MushroomLocationRecord[]) => {
-    markersRef.current.forEach((marker) => marker.remove());
-    markersRef.current = [];
-
-    if (!mapRef.current) {
-      return;
-    }
-
-    markersRef.current = nextMushrooms.map((mushroom) => {
-      const marker = new maplibregl.Marker({
-        element: createMushroomMarkerElement(mushroom),
-        anchor: "bottom",
-      })
-        .setLngLat([mushroom.longitude, mushroom.latitude])
-        .setPopup(
-          new maplibregl.Popup({ offset: 12 }).setHTML(
-            `<strong>${mushroom.title ?? mushroom.externalKey}</strong><br/>${getMushroomSourceLayerLabel(
-              getLocationSourceLayer(mushroom),
-            )}<br/>${mushroom.derivedState?.currentStatus ?? "UNKNOWN"}`,
-          ),
-        )
-        .addTo(mapRef.current!);
-
-      marker.getElement().addEventListener("click", () => {
-        setSelectedId(mushroom.id);
-      });
-
-      return marker;
-    });
-  }, [createMushroomMarkerElement]);
 
   const syncCurrentLocationMarker = useCallback(
     (latitude?: number, longitude?: number) => {
@@ -452,11 +424,17 @@ export function MushroomMapClient() {
       setCachedMushroomsPayload(cacheKey, resolvedPayload);
       return resolvedPayload;
     });
-    const visibleMushrooms = getVisibleMushroomsFromCachedPayload(nextCachedPayload, viewport);
+    const visibleMushrooms = reconcileDisplayMushrooms(
+      visibleMushroomsRef.current,
+      getVisibleMushroomsFromCachedPayload(nextCachedPayload, viewport),
+    );
 
+    visibleMushroomsRef.current = visibleMushrooms;
     setMushrooms(visibleMushrooms);
     setSelectedId((current) =>
-      visibleMushrooms.some((mushroom) => mushroom.id === current) ? current : visibleMushrooms[0]?.id ?? null,
+      visibleMushrooms.some((mushroom) => mushroom.id === current)
+        ? current
+        : visibleMushrooms[0]?.id ?? null,
     );
   }, []);
 
@@ -606,6 +584,10 @@ export function MushroomMapClient() {
   }, [refreshMushrooms]);
 
   useEffect(() => {
+    visibleMushroomsRef.current = visibleMushrooms;
+  }, [visibleMushrooms]);
+
+  useEffect(() => {
     if (!isLocationHydrated || mapRef.current || !mapContainerRef.current) {
       return;
     }
@@ -619,6 +601,50 @@ export function MushroomMapClient() {
     });
 
     map.addControl(new maplibregl.NavigationControl(), "top-right");
+    map.on("load", () => {
+      map.addSource(MUSHROOM_SOURCE_ID, {
+        type: "geojson",
+        data: buildMushroomFeatureCollection([]),
+      });
+      map.addLayer({
+        id: MUSHROOM_CIRCLE_LAYER_ID,
+        type: "circle",
+        source: MUSHROOM_SOURCE_ID,
+        paint: {
+          "circle-radius": ["match", ["get", "layer"], "candidate", 6, 8],
+          "circle-color": [
+            "match",
+            ["get", "status"],
+            "ACTIVE",
+            "#4ade80",
+            "DEFEATED",
+            "#f87171",
+            "#facc15",
+          ],
+          "circle-stroke-width": ["match", ["get", "layer"], "candidate", 2, 3],
+          "circle-stroke-color": ["match", ["get", "layer"], "candidate", "#fde68a", "#effff4"],
+          "circle-opacity": ["match", ["get", "layer"], "candidate", 0.75, 0.95],
+        },
+      });
+      map.addLayer({
+        id: MUSHROOM_LABEL_LAYER_ID,
+        type: "symbol",
+        source: MUSHROOM_SOURCE_ID,
+        layout: {
+          "text-field": ["get", "shortLabel"],
+          "text-size": 10,
+          "text-offset": [0, -1.4],
+          "text-anchor": "bottom",
+          "text-font": ["Open Sans Bold"],
+        },
+        paint: {
+          "text-color": "#07131a",
+          "text-halo-color": "#effff4",
+          "text-halo-width": 1.4,
+        },
+      });
+      refreshMushroomsRef.current();
+    });
     map.on("error", (event) => {
       setFeedbackTone("error");
       setFeedback(
@@ -635,6 +661,30 @@ export function MushroomMapClient() {
       refreshMushroomsRef.current();
     });
     map.on("click", (event) => {
+      const features = map.queryRenderedFeatures(event.point, {
+        layers: [MUSHROOM_CIRCLE_LAYER_ID, MUSHROOM_LABEL_LAYER_ID],
+      });
+      const clickedId = features[0]?.properties?.id;
+
+      if (typeof clickedId === "string") {
+        const mushroom = visibleMushroomsRef.current.find((item) => item.id === clickedId);
+
+        if (mushroom) {
+          setSelectedId(mushroom.id);
+          applySelectedMushroomToForm(mushroom);
+          new maplibregl.Popup({ offset: 12 })
+            .setLngLat([mushroom.longitude, mushroom.latitude])
+            .setHTML(
+              `<strong>${mushroom.title ?? mushroom.externalKey}</strong><br/>${getMushroomSourceLayerLabel(
+                getLocationSourceLayer(mushroom),
+              )}<br/>${mushroom.derivedState?.currentStatus ?? "UNKNOWN"}`,
+            )
+            .addTo(map);
+          return;
+        }
+      }
+
+      setSelectedId(null);
       setFormState((current) => ({
         ...current,
         latitude: event.lngLat.lat.toFixed(5),
@@ -653,20 +703,41 @@ export function MushroomMapClient() {
   }, [initialMapCenter, initialMapZoom, isLocationHydrated]);
 
   useEffect(() => {
-    if (!selectedMushroom) {
-      return;
-    }
-
-    applySelectedMushroomToForm(selectedMushroom);
-  }, [applySelectedMushroomToForm, selectedMushroom]);
-
-  useEffect(() => {
     syncCurrentLocationMarker(currentLocation.latitude, currentLocation.longitude);
   }, [currentLocation.latitude, currentLocation.longitude, syncCurrentLocationMarker]);
 
   useEffect(() => {
-    syncMarkers(visibleMushrooms);
-  }, [syncMarkers, visibleMushrooms]);
+    const map = mapRef.current;
+
+    if (!map) {
+      return;
+    }
+
+    const source = map.getSource(MUSHROOM_SOURCE_ID) as GeoJSONSource | undefined;
+
+    if (!source) {
+      return;
+    }
+
+    source.setData({
+      type: "FeatureCollection",
+      features: visibleMushrooms.map((mushroom) => ({
+        type: "Feature" as const,
+        id: mushroom.id,
+        geometry: {
+          type: "Point" as const,
+          coordinates: [mushroom.longitude, mushroom.latitude],
+        },
+        properties: {
+          id: mushroom.id,
+          title: mushroom.title ?? mushroom.externalKey,
+          layer: getLocationSourceLayer(mushroom),
+          status: mushroom.derivedState?.currentStatus ?? "UNKNOWN",
+          shortLabel: markerShortLabelMap[mushroom.id] ?? getMushroomMarkerShortLabel(mushroom),
+        },
+      })),
+    });
+  }, [markerShortLabelMap, visibleMushrooms]);
 
   useEffect(() => {
     if (
@@ -791,7 +862,7 @@ export function MushroomMapClient() {
               </>
             )}
           </div>
-          <div ref={mapContainerRef} className="map-surface" />
+          <div ref={mapContainerRef} className="map-surface" data-testid="map-surface" />
         </div>
 
         <aside className="sidebar">
@@ -881,7 +952,10 @@ export function MushroomMapClient() {
                 <button
                   key={mushroom.id}
                   className={`mushroom-row ${selectedMushroom?.id === mushroom.id ? "is-selected" : ""}`}
-                  onClick={() => setSelectedId(mushroom.id)}
+                  onClick={() => {
+                    setSelectedId(mushroom.id);
+                    applySelectedMushroomToForm(mushroom);
+                  }}
                   type="button"
                 >
                   <strong>{mushroom.title ?? mushroom.externalKey}</strong>
@@ -925,7 +999,7 @@ export function MushroomMapClient() {
             <div className="report-helper">
               <div className="report-helper__summary">
                 <strong>{selectedMushroom?.title ?? "尚未選取蘑菇"}</strong>
-                <span>
+                <span data-testid="form-coordinate-summary">
                   目前表單座標：{formState.latitude}, {formState.longitude}
                 </span>
               </div>
